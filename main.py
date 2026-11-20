@@ -130,6 +130,9 @@ def band_of(t, mission_pos):
     return ("misc", 0)
 
 
+CHAPTER_CEILINGS = {1: 85.0, 2: 75.0, 3: 65.0, 4: 55.0}  # by chapter no.
+CHAPTER_CEILING_DEFAULT = 50.0  # chapters 5-6 and any later chapter
+
 CEILING = {  # safety-rail ceilings, percent (loose: the asymptote grid
     # penalty, not the rail, is what stops runaway fits)
     "ultra": 2.5, "final": 40.0, "strand": 35.0, "mission": 60.0,
@@ -140,7 +143,7 @@ CEILING = {  # safety-rail ceilings, percent (loose: the asymptote grid
 
 def ceiling_of(band, sub):
     if band == "chapter":
-        return {1: 85.0, 2: 75.0, 3: 65.0, 4: 55.0}.get(sub, 50.0)
+        return CHAPTER_CEILINGS.get(sub, CHAPTER_CEILING_DEFAULT)
     return CEILING.get(band, 60.0)
 
 
@@ -285,6 +288,7 @@ def fit_saturating(ts, vals, ceiling, t_target):
     ws = [w * (0.25 if v <= 0.0 else 1.0) for w, v in zip(ws, vals)]
     x_t = math.log(max(t_target + AGE_OFF, 0.05))
     x_last = xs[-1]
+    total_w = sum(ws)  # ws is fixed for the whole grid search below
     grid = []
     for f in (1.04, 1.15, 1.35, 1.7, 2.2, 3.0, 4.2, 6.0, 9.0, 14.0, 22.0):
         a_cand = min(vmax * f, ceiling)
@@ -301,7 +305,7 @@ def fit_saturating(ts, vals, ceiling, t_target):
         a, b, sse = wlin_fit(xs, ys, ws)
         if b < 0:
             b = 0.0
-            a = sum(w * y for w, y in zip(ws, ys)) / sum(ws)
+            a = sum(w * y for w, y in zip(ws, ys)) / total_w
             sse = sum(w * (y - a) ** 2 for w, y in zip(ws, ys))
         score = sse * (1.0 + PENALTY * math.log(A / vmax))
         span = max(0.0, x_t - x_last)
@@ -322,7 +326,7 @@ def fit_saturating(ts, vals, ceiling, t_target):
     else:
         chosen = cands[0]
     _, A, a, b, sse, pred = chosen
-    resid = math.sqrt(sse / max(sum(ws), 1e-9))
+    resid = math.sqrt(sse / max(total_w, 1e-9))
     return pred, resid, b
 
 
