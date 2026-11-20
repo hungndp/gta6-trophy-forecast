@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GTA VI trophy earn-rate forecaster (v2).
+"""GTA VI trophy earn-rate forecaster (v3).
 
 Forecasts each trophy's Exophase earn rate (percent of tracked players who
 have earned it) at a case's target time, as five quantiles on the logit
@@ -10,13 +10,18 @@ Model (fused layers):
 1. ANCHOR / REFRESH-DILUTION CALIBRATION.  Exophase refreshes flood the
    tracked-player denominator while earned counts grow at band-specific
    speeds, so rates dip at a refresh and then recover as players progress.
-   The response was calibrated on a real observed transition: the frozen
-   638-player launch-night history (earned counts of 4-13 per trophy) and
-   a live Exophase read ~7 h later, in which Chapter 1's rate had risen
-   ~6.4x, early leisure activities ~1-5x, Chapter 2 was ~flat, and late
-   story / grind / strand trophies had collapsed to ~0.015x.  When a
-   case's own history contains refreshes (players_tracked jumps), the
-   response is instead fit from the case itself (layer 3).
+   The response was calibrated on TWO real observed transitions from the
+   frozen 638-player launch-night history (earned counts of 4-13 per
+   trophy): a live Exophase read ~7 h later, in which Chapter 1's rate had
+   risen ~6.4x, early leisure activities ~1-5x, Chapter 2 was ~flat, and
+   late story / grind / strand trophies had collapsed to ~0.015x; and a
+   second read ~35 h later (Chapter 1 ~8.9x, fishing ~6.3x, collapsed
+   bands still collapsed).  v3 interpolates the rate ratio between both
+   anchors in log-log space and continues past 35 h with a strongly
+   damped power, replacing v2's recovery toward the band ceilings, which
+   overshot a 35 h out-of-sample test badly.  When a case's own history
+   contains refreshes (players_tracked jumps), the response is instead
+   fit from the case itself (layer 3).
 
 2. CHAPTER-CALIBRATED BANDS.  Trophies are grouped from their own
    description/order/tier into bands -- story chapters in order, named
@@ -36,7 +41,14 @@ Model (fused layers):
    decomposition is fit (both saturating); its ratio captures refresh
    dilution directly, and disagreement between the two fits widens the
    spread (and can blend the median, weight W_EN, kept at 0 after
-   backtests showed the direct fit's medians were stronger).
+   backtests showed the direct fit's medians were stronger).  v3 repairs
+   the player-growth fit the decomposition leans on: the growth family
+   (saturating vs power-law) is chosen by holdout instead of an ad-hoc
+   SSE penalty, and the earned-count ceiling is sized by the most
+   generous family prediction so an underestimated player target cannot
+   cap earned counts.  Recent reads also carry more weight (0.25 -> 1.0):
+   on a step-like refresh history the freshest refresh state is the
+   anchor.
 
 4. GRADE-TIGHTENED SPREADS.  The logit sigma varies by band, base rate
    and fit residual: tighter where a band is predictable (late story,
@@ -179,6 +191,42 @@ def frozen_params(band, sub):
     return FROZEN[(band, sub)]
 
 
+# Ratio anchors at 35.37 h (2122 min), calibrated on the second real
+# transition: the frozen 638-player history vs the live Exophase read of
+# 2026-11-20T14:22Z, as band medians of per-trophy rate ratios.  Early
+# bands kept growing slowly (Chapter 1 x8.88, fishing x6.26, first named
+# mission x3.43); collapsed bands stayed collapsed (~0.01-0.03).
+FROZEN_R35 = {
+    ("ultra", 0):   0.004,
+    ("chapter", 1): 8.88,
+    ("chapter", 2): 1.31,
+    ("chapter", 3): 0.027,
+    ("chapter", 4): 0.018,
+    ("final", 0):   0.018,
+    ("strand", 0):  0.013,
+    ("leisure", 0): 1.39,
+    ("leisure", 1): 6.26,
+    ("leisure", 2): 0.78,
+    ("organic", 0): 0.23,
+    ("organic", 2): 1.14,
+    ("grind", 0):   0.006,
+    ("misc", 0):    0.013,
+    ("mission", 0): 3.43,
+}
+
+R35_H = 35.37  # horizon of the second calibration read, hours
+
+
+def frozen_r35(band, sub):
+    if (band, sub) in FROZEN_R35:
+        return FROZEN_R35[(band, sub)]
+    if band == "chapter":
+        return 0.024
+    if band == "mission":
+        return 0.022
+    return 0.015
+
+
 def frozen_forecast(band, sub, r0, horizon_h):
     """Median + sigma for a history with no observed dynamics."""
     if band == "full" or r0 >= 99.9:
@@ -198,13 +246,25 @@ def frozen_forecast(band, sub, r0, horizon_h):
         ratio = math.exp((1 - w) * math.log(r90) + w * math.log(r420))
         sigma = s90 + w * (s420 - s90)
         return clamp(r0 * ratio, 0.004, ceil), sigma
-    # beyond the calibrated read: recover toward the band ceiling with a
-    # damped (log-time) approach; never fall far below the 7 h anchor.
-    m7 = clamp(r0 * r420, 0.004, ceil)
-    m = ceil - (ceil - m7) * math.exp(-krec * math.log(h / 7.0))
-    m = max(m, m7 * 0.85)
-    sigma = min(1.15, s420 * (1.0 + 0.06 * math.log(h / 7.0)))
-    return clamp(m, 0.004, ceil), sigma
+    # beyond the 7 h calibrated read: follow the second real transition.
+    # Log-log interpolate the ratio from the 7 h anchor to the 35.37 h
+    # anchor, then continue with a strongly damped power (30% of the
+    # observed log-slope, capped) so growing bands keep creeping and
+    # collapsed bands stay down.  (v2 recovered toward the band ceiling
+    # here and overshot a 35 h out-of-sample test by ~28x on loss.)
+    r35 = max(frozen_r35(band, sub), 0.004)
+    s35 = min(1.35, s420 + 0.32)
+    if h <= R35_H:
+        w = math.log(h / 7.0) / math.log(R35_H / 7.0)
+        ratio = math.exp((1 - w) * math.log(max(r420, 0.004))
+                         + w * math.log(r35))
+        sigma = s420 + w * (s35 - s420)
+        return clamp(r0 * ratio, 0.004, ceil), sigma
+    slope = math.log(r35 / max(r420, 0.004)) / math.log(R35_H / 7.0)
+    gamma = clamp(0.3 * slope, 0.0, 0.15)
+    ratio = r35 * (h / R35_H) ** gamma
+    sigma = min(1.35, s35 * (1.0 + 0.05 * math.log(h / R35_H)))
+    return clamp(r0 * ratio, 0.004, ceil), sigma
 
 
 
@@ -284,7 +344,7 @@ def fit_saturating(ts, vals, ceiling, t_target):
     if vmax <= 0:
         return 0.0, 0.5, 0.0
     xs = [math.log(max(t + AGE_OFF, 0.05)) for t in ts]
-    ws = [0.4 + 0.6 * (j / (m - 1) if m > 1 else 1.0) for j in range(m)]
+    ws = [0.25 + 0.75 * (j / (m - 1) if m > 1 else 1.0) for j in range(m)]
     ws = [w * (0.25 if v <= 0.0 else 1.0) for w, v in zip(ws, vals)]
     x_t = math.log(max(t_target + AGE_OFF, 0.05))
     x_last = xs[-1]
@@ -330,19 +390,14 @@ def fit_saturating(ts, vals, ceiling, t_target):
     return pred, resid, b
 
 
-def fit_players(ts, ns, t_target):
-    """Fit players_tracked with two families (saturating logistic in time,
-    power law in time) and return the better-fitting family's N(t_target),
-    mildly shrunk toward the worse one for robustness."""
+def _player_family_preds(ts, ns, t_target):
+    """Both player-growth families' predictions at t_target:
+    [(kind, sse, pred), ...] -- the saturating-logistic family (best cap
+    by penalised SSE) and the power-law family (one entry per offset)."""
     m = len(ts)
-    if m == 0 or max(ns) <= 0:
-        return ns[-1] if ns else 0.0
+    ws = [0.4 + 0.6 * (j / (m - 1)) for j in range(m)] if m > 1 else [1.0]
+    out = []
     nmax = max(ns)
-    if m == 1 or nmax <= ns[0] * 1.001:
-        return nmax
-    ws = [0.4 + 0.6 * (j / (m - 1)) for j in range(m)]
-    preds = []
-    # family 1: logistic saturation in t
     best = None
     for f in (1.15, 1.5, 2.1, 3.0, 4.5, 7.0, 11.0):
         cap = nmax * f
@@ -359,8 +414,7 @@ def fit_players(ts, ns, t_target):
     if best is not None:
         _, cap, a, b = best
         frac = 1.0 / (1.0 + math.exp(-clamp(a + b * t_target, -30, 30)))
-        preds.append((best[0], cap * frac))
-    # family 2: power law N = c * (t + off)^p, fit in log-log
+        out.append(("logistic", best[0], cap * frac))
     for off in (0.5, 2.0, 6.0):
         xs = [math.log(max(t + off, 0.05)) for t in ts]
         ys = [math.log(max(n, 1.0)) for n in ns]
@@ -368,18 +422,67 @@ def fit_players(ts, ns, t_target):
         if b <= 0:
             continue
         pred = math.exp(a + b * math.log(max(t_target + off, 0.05)))
-        preds.append((sse * 2.0, pred))  # log-scale SSE not comparable; penalise
-    if not preds:
+        out.append(("powerlaw", sse, pred))
+    return out
+
+
+def fit_players(ts, ns, t_target):
+    """Fit players_tracked with two families (saturating logistic in time,
+    power law in time) and return the better family's N(t_target), mildly
+    shrunk toward the runner-up for robustness.
+
+    v3: the family is chosen by HOLDOUT -- refit each family without the
+    last two reads and score its prediction of the final read in log
+    space -- instead of v2's raw-SSE comparison with an ad-hoc x2 penalty
+    on the power law, which let the saturating family win almost always
+    and systematically underestimated launch growth."""
+    m = len(ts)
+    if m == 0 or max(ns) <= 0:
+        return ns[-1] if ns else 0.0
+    nmax = max(ns)
+    if m == 1 or nmax <= ns[0] * 1.001:
         return nmax
-    preds.sort(key=lambda p: p[0])
-    best_pred = preds[0][1]
-    if len(preds) > 1:
-        best_pred = math.exp(0.75 * math.log(best_pred)
-                             + 0.25 * math.log(max(preds[1][1], 1.0)))
+    fams = _player_family_preds(ts, ns, t_target)
+    if not fams:
+        return nmax
+
+    def holdout_err(kind):
+        if len(ts) < 5:
+            return None
+        sub = _player_family_preds(ts[:-2], ns[:-2], ts[-1])
+        cand = [p for k, _s, p in sub if k == kind]
+        if not cand:
+            return None
+        return abs(math.log(max(cand[0], 1.0))
+                   - math.log(max(ns[-1], 1.0)))
+
+    scored = []
+    for kind, sse, pred in fams:
+        err = holdout_err(kind)
+        scored.append((err if err is not None else sse, pred))
+    scored.sort(key=lambda p: p[0])
+    best_pred = scored[0][1]
+    if len(scored) > 1:
+        best_pred = math.exp(0.75 * math.log(max(best_pred, 1.0))
+                             + 0.25 * math.log(max(scored[1][1], 1.0)))
     return clamp(best_pred, nmax, 3.0e6)
 
 
-SIGMA_MULT = 0.6
+def fit_players_hi(ts, ns, t_target):
+    """Generous denominator estimate: the largest family prediction.
+
+    Used only to size the earned-count fit's ceiling, so an
+    underestimated player target cannot cap earned counts -- the v2
+    failure mode the decomposition leaders avoid by construction."""
+    fams = _player_family_preds(ts, ns, t_target)
+    if not fams:
+        return ns[-1] if ns else 0.0
+    return clamp(max(p for _k, _s, p in fams), max(ns), 3.0e6)
+
+
+SIGMA_MULT = 0.50  # v2 used 0.60 as insurance; the v3 suite (two
+# synthetic worlds, coverage held at 1.00) supports 0.50 -- 0.45 was
+# tried and started costing coverage, so it stops here.
 
 
 def rich_forecast(case, times, ns, rates_mat, horizon_h):
@@ -412,8 +515,10 @@ def rich_forecast(case, times, ns, rates_mat, horizon_h):
         pred_r, resid_r, _b = fit_saturating(times, vals, ceil, t_target)
         # (b) earned-count decomposition: E(t) saturating, N(t) saturating
         earned = [v / 100.0 * n for v, n in zip(vals, ns)]
+        n_ceil = max(n_target, n_last, 1.0,
+                     fit_players_hi(times, ns, t_target))
         pred_e, resid_e, _b2 = fit_saturating(
-            times, earned, ceil / 100.0 * max(n_target, n_last, 1.0),
+            times, earned, ceil / 100.0 * n_ceil,
             t_target)
         pred_en = (pred_e / n_target * 100.0) if n_target > 0 else pred_r
         # logit-space blend (weight W_EN; the decomposition's main job
